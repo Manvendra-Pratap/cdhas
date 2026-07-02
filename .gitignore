@@ -2,5 +2,6 @@
 __pycache__/
 *.log
 node_modules/
-
-cowrie/.git
+cowrie/*
+!cowrie/etc/cowrie.cfg
+!cowrie/docker-compose.yml
