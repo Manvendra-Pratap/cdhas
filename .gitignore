@@ -6,3 +6,4 @@ cowrie/*
 !cowrie/etc/cowrie.cfg
 !cowrie/docker-compose.yml
 data/
+data/
