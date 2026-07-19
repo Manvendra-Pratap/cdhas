@@ -4,6 +4,12 @@ import os
 # Import time to add a short sleep in the main watcher loop to avoid busy-waiting
 import time
 
+# Import threading/queue so geo enrichment can run off the ingestion critical path.
+# Previously enrich_ip() (HTTP call + 1s sleep) ran synchronously inside on_modified,
+# which meant a burst of attack events would queue up behind the rate-limited API call.
+import threading
+import queue
+
 # Import watchdog's FileSystemEventHandler base class — we subclass it to handle file events
 from watchdog.events import FileSystemEventHandler
 
@@ -19,8 +25,13 @@ from backend.enrichment.geolocate import enrich_ip
 # Import the MongoDB collection getter so we can insert documents into the attacks collection
 from backend.db.mongo import get_collection
 
-# Define the exact absolute path to the Cowrie JSON log file we want to watch
-LOG_FILE_PATH = "/home/maanu/cdhas/cowrie/var/log/cowrie/cowrie.json"
+# Path to the Cowrie JSON log file — configurable per machine via env var, since every
+# teammate's Cowrie install lives at a different path. Falls back to Maanu's original
+# path only as a default for local dev.
+LOG_FILE_PATH = os.environ.get(
+    "CDHAS_COWRIE_LOG_PATH",
+    "/home/maanu/cdhas/cowrie/var/log/cowrie/cowrie.json",
+)
 
 
 # Define our custom event handler class that extends FileSystemEventHandler
@@ -41,14 +52,40 @@ class CowrieLogHandler(FileSystemEventHandler):
         # Store a reference to the MongoDB attacks collection for inserting documents
         self._collection = get_collection()
 
+        # Bounded queue of (mongo_id, ip) pairs waiting for geo enrichment. Bounded so a
+        # huge burst can't grow this unbounded in memory — worker just falls behind, doesn't crash.
+        self._enrich_queue = queue.Queue(maxsize=10000)
+
+        # Background thread that drains the queue and does the slow (rate-limited) geo calls,
+        # completely off the ingestion path. daemon=True so it doesn't block process exit.
+        self._enrich_thread = threading.Thread(target=self._enrichment_worker, daemon=True)
+        self._enrich_thread.start()
+
+    # Runs forever in a background thread: pulls (doc_id, ip) off the queue, calls the
+    # rate-limited geo API, then patches just the geo fields onto the already-inserted doc.
+    def _enrichment_worker(self):
+        while True:
+            doc_id, ip = self._enrich_queue.get()
+            geo = enrich_ip(ip)
+            self._collection.update_one({"_id": doc_id}, {"$set": geo})
+            country = geo.get("country") or "Unknown"
+            print(f"Enriched attack from {ip} [{country}]")
+
     # This method is called by watchdog whenever a file modification event is detected
     def on_modified(self, event):
         # Only react to events on our specific log file — ignore any other files in the directory
-        if not event.src_path.endswith("cowrie.json"):
+        if event.src_path != LOG_FILE_PATH:
             return
 
-        # Read all new lines that were added since we last checked the file position
-        for raw_line in self._file:
+        # Read all new lines added since we last checked. Using readline() in a loop
+        # instead of "for line in self._file" — the file-iterator form does internal
+        # readahead buffering that behaves unreliably on a file that's actively growing
+        # (can miss lines across separate on_modified calls). readline() has no such issue.
+        while True:
+            raw_line = self._file.readline()
+            if not raw_line:
+                break
+
             # Use the Cowrie parser to turn the raw JSON string into a normalized Python dict
             parsed = parse_line(raw_line)
 
@@ -59,21 +96,20 @@ class CowrieLogHandler(FileSystemEventHandler):
             # Extract the source IP from the parsed event to use for geolocation lookup
             ip = parsed.get("source_ip", "")
 
-            # Call the geolocation API (or return None fields for private IPs)
-            geo = enrich_ip(ip)
+            # Insert the RAW parsed event immediately — no waiting on the geo API.
+            # Geo fields will be missing until the background worker patches them in.
+            result = self._collection.insert_one(parsed)
 
-            # Merge the parsed event dict and the geo enrichment dict into a single combined dict
-            # The ** unpacking operator spreads both dicts into one — geo fields are added to parsed
-            combined = {**parsed, **geo}
-
-            # Insert the combined document into the MongoDB attacks collection
-            self._collection.insert_one(combined)
-
-            # Extract the country from the geo data for the confirmation print message
-            country = geo.get("country") or "Unknown"
+            # Hand the new doc's _id and IP off to the background enrichment worker.
+            # If the queue is full (extreme burst), drop enrichment for this one rather
+            # than blocking ingestion — losing a geo lookup is better than losing the event.
+            try:
+                self._enrich_queue.put_nowait((result.inserted_id, ip))
+            except queue.Full:
+                print(f"Enrichment queue full — skipping geo lookup for {ip}")
 
             # Print a confirmation message to stdout for each successfully saved attack event
-            print(f"Saved attack from {ip} [{country}]")
+            print(f"Saved attack from {ip} (enrichment queued)")
 
 
 # Define the start() function — the main entry point that sets up and runs the file watcher
