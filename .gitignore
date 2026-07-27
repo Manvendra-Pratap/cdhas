@@ -1,9 +1,26 @@
-.env
-__pycache__/
-*.log
+# React
 node_modules/
-cowrie/*
-!cowrie/etc/cowrie.cfg
-!cowrie/docker-compose.yml
-data/
-data/
+dist/
+.vite/
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Environment
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
