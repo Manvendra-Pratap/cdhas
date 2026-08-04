@@ -5,7 +5,7 @@ from backend.utils.logger import get_logger
 logger = get_logger("database")
 
 try:
-    _client = MongoClient(settings.MONGO_URI, serverSelectionTimeoutMS=400, connectTimeoutMS=400)
+    _client = MongoClient(settings.MONGO_URI, serverSelectionTimeoutMS=5000, connectTimeoutMS=5000, socketTimeoutMS=30000)
     _db = _client[settings.DB_NAME]
     logger.info(f"Initialized MongoDB connection client for DB: '{settings.DB_NAME}' at {settings.MONGO_URI}")
 except Exception as err:
@@ -21,7 +21,7 @@ def get_collection():
 def check_mongo_health() -> bool:
     try:
         col = get_collection()
-        col.command("ping")
+        col.database.command("ping")
         return True
     except Exception as err:
         logger.debug(f"MongoDB ping health check failed: {err}")
